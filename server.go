@@ -13,14 +13,17 @@ import (
 	"encoding/json"
 	"regexp"
 	"errors"
+	"encoding/hex"
+	"crypto/rand"
+	"strings"
+	"net"
 )
 
 const configFileName string = "config.json"
 
 type config struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
-	Token string `json:"digitalocean_token"`
+	Token string `json:"token"`
+	DigitalOcean_Token string `json:"digitalocean_token"`
 }
 
 func (conf *config) write() error {
@@ -41,15 +44,10 @@ func readConfig(conf *config) error {
 }
 
 func (conf *config) validate() error {
-	usernameRegex := regexp.MustCompile(`^[[:alpha:]]+$`)
-	//http://www.sussex.ac.uk/its/help/faq?faqid=839
-	passwordRegex := regexp.MustCompile(`^[a-zA-Z0-9{}()\]\]#:;^,.?!|&_` + "`" + `~@$%/\\=+\-*"' ]{10,127}$`)
 	tokenRegex := regexp.MustCompile(`^[[:xdigit:]]{64}$`)
-	if (!usernameRegex.MatchString(conf.Username)) {
-		return errors.New("invalid username")
-	} else if (!passwordRegex.MatchString(conf.Password)) {
-		return errors.New("invalid password: requirements here: http://www.sussex.ac.uk/its/help/faq?faqid=839")
-	} else if (!tokenRegex.MatchString(conf.Token)) {
+	if (!tokenRegex.MatchString(conf.Token)) {
+		return errors.New("invalid token")
+	} else if (!tokenRegex.MatchString(conf.DigitalOcean_Token)) {
 		return errors.New("invalid digitalocean_token")
 	} else {
 		return nil
@@ -70,7 +68,9 @@ func main() {
 	if (err != nil) {
 		switch err.Error() {
 			case "open " + configFileName + ": no such file or directory":
-				makeBlankConfig()
+				if (makeBlankConfig() != nil) {
+					log.Fatal("Error creating blank config: ", err)
+				}
 				log.Fatal("No config file exists. Blank config file created.")
 		}
 		log.Fatal(err)
@@ -82,59 +82,99 @@ func main() {
 	}
 
 	router := httprouter.New()
-	router.POST("/update", getHandler(&conf))
+	router.PUT("/:domain", getUpdateHandler(&conf))
 
 	fmt.Println("\033[0;32mServer started\033[0m")
 	log.Fatal(http.ListenAndServe(":9096", router))
 }
 
-func makeBlankConfig() {
+func makeBlankConfig() error {
+	bs := make([]byte, 32)
+	n, err := rand.Read(bs)
+	if (n != 32 || err != nil) {
+		return err
+	}
 	blankConfig := &config{
-		Username: "",
-		Password: "",
-		Token: "",
+		Token: hex.EncodeToString(bs),
+		DigitalOcean_Token: "",
 	}
 
-	blankConfig.write()
+	return blankConfig.write()
 }
 
 /***************************************************/
 /*****************Update Handler********************/
 /***************************************************/
-func getHandler(conf *config) func(http.ResponseWriter, *http.Request, httprouter.Params)  {
+func getUpdateHandler(conf *config) func(http.ResponseWriter, *http.Request, httprouter.Params)  {
 	return func (w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-		buf := make([]byte, r.ContentLength)
-		io.ReadFull(r.Body, buf)
+		authHeader := r.Header.Get("Authorization")
+		if (!strings.HasPrefix(authHeader, "Bearer ")) {
+			log.Println("Incorrect authorization format")
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		requestToken := authHeader[7:]
+
+		if requestToken != conf.Token {
+			log.Println("Incorrect auth token")
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+
 		type DDNSUpdateRequest struct {
-			Username  string `json:"user"`
-			Password string `json:"pass"`
-			Domain string `json:"domain"`
 			Ip string `json:"ip,omitempty"`
 		}
 		var ddnsUpdateRequest DDNSUpdateRequest
-		err := json.Unmarshal(buf, &ddnsUpdateRequest)
-		if err != nil {
-			log.Println("ERROR: Error processing request: ", err)
-			fmt.Fprint(w, "Error processing request\n")
-			return
-		} else if (ddnsUpdateRequest.Username != conf.Username) {
-			log.Println("Incorrect username")
-			fmt.Fprint(w, "Incorrect username\n")
-			return
-		} else if (ddnsUpdateRequest.Password != conf.Password) {
-			log.Println("Incorrect password")
-			fmt.Fprint(w, "Incorrect password\n")
-			return
+		var err error
+		if (r.ContentLength > 0) {
+			buf := make([]byte, r.ContentLength)
+			io.ReadFull(r.Body, buf)
+			err = json.Unmarshal(buf, &ddnsUpdateRequest)
+			if err != nil {
+				log.Println("ERROR: Error processing request: ", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
 		}
 
-		digitaloceanClient := digitalocean.GetClient(conf.Token)
-		err = digitaloceanClient.UpdateRecord(ddnsUpdateRequest.Domain, ddnsUpdateRequest.Ip)
-		if (err != nil) {
-			log.Println("ERROR: Error updating dns: " + err.Error())
-			fmt.Fprint(w, "ERROR: Error updating dns: " + err.Error())
-			return
+		parsedIP := net.ParseIP(ddnsUpdateRequest.Ip)
+		requestIP := r.Header.Get("X-Real-IP")
+		if requestIP == "" {
+			log.Println("ERROR: Configuration error: No X-Real-IP header set")
+			//Don't return here to allow given to be used
+			if (parsedIP == nil) {
+				w.WriteHeader(http.StatusInternalServerError)
+			}
 		}
 
-		fmt.Fprint(w, "Successfully updated")
+		ip := parsedIP
+		if ip == nil {
+			ip = net.ParseIP(requestIP)
+		}
+
+		digitaloceanClient := digitalocean.GetClient(conf.DigitalOcean_Token)
+		status, err := digitaloceanClient.UpdateRecord(ps.ByName("domain"), ip)
+		switch status {
+		case digitalocean.OK:
+			log.Println("Successfully updated ", ps.ByName("domain"), " to ", ip)
+			w.WriteHeader(http.StatusOK)
+			return
+		case digitalocean.NOT_MODIFIED:
+			log.Println("Record already up to date")
+			w.WriteHeader(http.StatusNotModified)
+			return
+		case digitalocean.BAD_REQUEST:
+			log.Println(err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		case digitalocean.NOT_FOUND:
+			log.Println("Domain ", ps.ByName("domain"), " not registered")
+			w.WriteHeader(http.StatusNotFound)
+			return
+		case digitalocean.INTERNAL_SERVER_ERROR:
+			log.Println(err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 	}
 }

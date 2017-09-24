@@ -3,11 +3,10 @@ package digitalocean
 import "github.com/digitalocean/godo"
 import "golang.org/x/oauth2"
 import "regexp"
-import "os"
 import "context"
 import "errors"
 import "strconv"
-import "log"
+import "net"
 
 type DDNSClient struct {
 	*godo.Client
@@ -32,16 +31,25 @@ func GetClient(token string) *DDNSClient {
 	return &DDNSClient{godo.NewClient(oauthClient)}
 }
 
-func (client DDNSClient) UpdateRecord(subdomain string, ip string) error {
+type Status int
+const (
+	OK Status = iota
+	NOT_MODIFIED
+	BAD_REQUEST
+	NOT_FOUND
+	INTERNAL_SERVER_ERROR
+)
+
+func (client DDNSClient) UpdateRecord(subdomain string, ip net.IP) (Status, error) {
 	if (len(subdomain) > 64) {
-		return errors.New("subdomain length of " + strconv.Itoa(len(subdomain)) + " is longer than 64 and invalid")
+		return BAD_REQUEST, errors.New("Subdomain length of " + strconv.Itoa(len(subdomain)) + " is longer than 64 and invalid")
 	}
 
 	re := regexp.MustCompile(`^((?:[a-zA-Z\-]+\.)+)([a-zA-Z\-]+\.[a-z]+)$`)
 	matches := re.FindStringSubmatch(subdomain)
 
 	if (matches == nil) {
-		return errors.New("Subdomain is not a valid format")
+		return BAD_REQUEST, errors.New("Subdomain is not a valid format")
 	}
 
 	domain := matches[2]
@@ -54,7 +62,8 @@ func (client DDNSClient) UpdateRecord(subdomain string, ip string) error {
 	records, _, err := domainsService.Records(context.TODO(), domain, paginationOptions)
 
 	if (err != nil) {
-		return err
+		//FIXME: case on errors
+		return NOT_FOUND, err
 	}
 
 	var domainRecord *godo.DomainRecord = nil
@@ -65,20 +74,19 @@ func (client DDNSClient) UpdateRecord(subdomain string, ip string) error {
 	}
 
 	if (domainRecord == nil) {
-		return errors.New("Subdomain not found")
+		return NOT_FOUND, errors.New("Subdomain not found")
 	}
 
-	if (domainRecord.Data == ip) {
-		log.Println("Record already up to date")
-		return nil
+	if (domainRecord.Data == ip.String()) {
+		return NOT_MODIFIED, nil
 	}
 
-	drer := &godo.DomainRecordEditRequest{ Data: ip }
+	drer := &godo.DomainRecordEditRequest{ Data: ip.String() }
 	_, _, err = domainsService.EditRecord(context.TODO(), domain, domainRecord.ID, drer)
 	if (err == nil) {
-		log.Println(os.Stderr, "DNS successfully updated")
-		return nil
+		return OK, nil
 	} else {
-		return err
+		//FIXME case on error
+		return INTERNAL_SERVER_ERROR, err
 	}
 }
