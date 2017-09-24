@@ -13,25 +13,26 @@ type DDNSClient struct {
 }
 
 type TokenSource struct {
-    AccessToken string
+	AccessToken string
 }
 
 func (t *TokenSource) Token() (*oauth2.Token, error) {
-    token := &oauth2.Token{
-        AccessToken: t.AccessToken,
-    }
-    return token, nil
+	token := &oauth2.Token{
+		AccessToken: t.AccessToken,
+	}
+	return token, nil
 }
 
 func GetClient(token string) *DDNSClient {
 	var tokenSource = &TokenSource{
-	    AccessToken: token,
+		AccessToken: token,
 	}
 	oauthClient := oauth2.NewClient(context.TODO(), tokenSource)
 	return &DDNSClient{godo.NewClient(oauthClient)}
 }
 
 type Status int
+
 const (
 	OK Status = iota
 	NOT_MODIFIED
@@ -41,14 +42,14 @@ const (
 )
 
 func (client DDNSClient) UpdateRecord(subdomain string, ip net.IP) (Status, error) {
-	if (len(subdomain) > 64) {
+	if len(subdomain) > 64 {
 		return BAD_REQUEST, errors.New("Subdomain length of " + strconv.Itoa(len(subdomain)) + " is longer than 64 and invalid")
 	}
 
 	re := regexp.MustCompile(`^((?:[a-zA-Z\-]+\.)+)([a-zA-Z\-]+\.[a-z]+)$`)
 	matches := re.FindStringSubmatch(subdomain)
 
-	if (matches == nil) {
+	if matches == nil {
 		return BAD_REQUEST, errors.New("Subdomain is not a valid format")
 	}
 
@@ -58,32 +59,32 @@ func (client DDNSClient) UpdateRecord(subdomain string, ip net.IP) (Status, erro
 
 	domainsService := client.Domains
 	//FIXME: won't work with more than 1000 records
-	paginationOptions := &godo.ListOptions{ PerPage: 1000 }
+	paginationOptions := &godo.ListOptions{PerPage: 1000}
 	records, _, err := domainsService.Records(context.TODO(), domain, paginationOptions)
 
-	if (err != nil) {
+	if err != nil {
 		//FIXME: case on errors
 		return NOT_FOUND, err
 	}
 
 	var domainRecord *godo.DomainRecord = nil
 	for _, v := range records {
-		if (v.Type == "A" && v.Name == domainPrefix) {
+		if v.Type == "A" && v.Name == domainPrefix {
 			domainRecord = &v
 		}
 	}
 
-	if (domainRecord == nil) {
+	if domainRecord == nil {
 		return NOT_FOUND, errors.New("Subdomain not found")
 	}
 
-	if (domainRecord.Data == ip.String()) {
+	if domainRecord.Data == ip.String() {
 		return NOT_MODIFIED, nil
 	}
 
-	drer := &godo.DomainRecordEditRequest{ Data: ip.String() }
+	drer := &godo.DomainRecordEditRequest{Data: ip.String()}
 	_, _, err = domainsService.EditRecord(context.TODO(), domain, domainRecord.ID, drer)
-	if (err == nil) {
+	if err == nil {
 		return OK, nil
 	} else {
 		//FIXME case on error
